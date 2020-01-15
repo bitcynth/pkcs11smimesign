@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"io"
+	"io/ioutil"
 	"os"
 
-	"github.com/miekg/pkcs11"
+	"github.com/bitcynth/cynpkcs11"
+	"github.com/mastahyeti/cms"
 )
 
 func signAction() error {
@@ -15,8 +19,8 @@ func signAction() error {
 	var fd io.ReadCloser
 
 	// Choose either the first non-flag argument or stdin
-	if len(flags.OtherArgs) == 1 {
-		fd, err = os.Open(flags.OtherArgs[0])
+	if len(otherArgs) == 1 {
+		fd, err = os.Open(otherArgs[0])
 		if err != nil {
 			return err
 		}
@@ -31,81 +35,117 @@ func signAction() error {
 		return err
 	}
 
+	sBeginSigning.emit()
+
 	// Create and initialize the PKCS#11 context
-	p := pkcs11.New(config.PKCS11Path)
-	err = p.Initialize()
+	ctx, err := cynpkcs11.New(cynpkcs11.ContextOptions{
+		PIN:          config.PIN,
+		PKCS11Module: config.PKCS11Path,
+	})
+	if err != nil {
+		return err
+	}
+	defer ctx.Close()
+
+	sd, err := cms.NewSignedData(inputBuffer.Bytes())
 	if err != nil {
 		return err
 	}
 
-	defer p.Destroy()
-	defer p.Finalize()
-
-	slots, err := p.GetSlotList(true)
+	certs, err := ctx.GetCertificates()
 	if err != nil {
 		return err
 	}
 
-	session, err := p.OpenSession(slots[0], pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
-	if err != nil {
-		return err
-	}
-	defer p.CloseSession(session)
-
-	err = p.Login(session, pkcs11.CKU_USER, config.PIN)
-	if err != nil {
-		return err
-	}
-	defer p.Logout(session)
-
-	// Find the private key
-	temp := []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_SIGN, true)}
-	err = p.FindObjectsInit(session, temp)
+	err = ctx.Signer.Initialize()
 	if err != nil {
 		return err
 	}
 
-	objs, _, err := p.FindObjects(session, 100)
-	if err != nil {
-		return err
-	}
-	p.FindObjectsFinal(session)
-
-	// Find the public key
-	temp2 := []*pkcs11.Attribute{pkcs11.NewAttribute(pkcs11.CKA_VERIFY, true)}
-	err = p.FindObjectsInit(session, temp2)
+	err = sd.Sign([]*x509.Certificate{certs[0]}, ctx.Signer)
 	if err != nil {
 		return err
 	}
 
-	objs2, _, err := p.FindObjects(session, 100)
+	if *detachSignFlag {
+		sd.Detached()
+	}
+
+	if len(config.TimestampURL) > 0 {
+		err = sd.AddTimestamps(config.TimestampURL)
+		if err != nil {
+			return err
+		}
+	}
+
+	chain, err := loadChain()
 	if err != nil {
 		return err
 	}
-	p.FindObjectsFinal(session)
+	chain = removeRootFromChain(chain)
 
-	// Sign the data in the input buffer
-	err = p.SignInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS, nil)}, objs[0])
-	if err != nil {
-		return err
-	}
-
-	inputData := inputBuffer.Bytes()
-	sig, err := p.Sign(session, inputData)
-	if err != nil {
-		return err
-	}
-
-	// Verify the signature we just created
-	err = p.VerifyInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS, nil)}, objs2[0])
+	err = sd.SetCertificates(chain)
 	if err != nil {
 		return err
 	}
 
-	err = p.Verify(session, inputData, sig)
+	der, err := sd.ToDER()
+	if err != nil {
+		return err
+	}
+
+	emitSigCreated(certs[0], *detachSignFlag)
+
+	if *armorFlag {
+		err = pem.Encode(os.Stdout, &pem.Block{
+			Type:  "SIGNED MESSAGE",
+			Bytes: der,
+		})
+	} else {
+		_, err = os.Stdout.Write(der)
+	}
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func loadChain() ([]*x509.Certificate, error) {
+	chainFileBytes, err := ioutil.ReadFile(config.CertificateChainPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var certs []*x509.Certificate
+
+	block, rest := pem.Decode(chainFileBytes)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	certs = append(certs, cert)
+	for len(rest) != 0 {
+		block, rest = pem.Decode(rest)
+		cert, err = x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+
+	return certs, nil
+}
+
+func removeRootFromChain(chain []*x509.Certificate) []*x509.Certificate {
+	for i, cert := range chain {
+		if bytes.Equal(cert.RawIssuer, cert.RawSubject) {
+			copy(chain[i:], chain[i+1:])
+			chain[len(chain)-1] = nil
+			chain = chain[:len(chain)-1]
+			break
+		}
+	}
+
+	return chain
 }
