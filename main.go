@@ -21,6 +21,7 @@ type Flags struct {
 	VerifyFlag   bool
 	ListKeysFlag bool
 	ArmorFlag    bool
+	DetachSign   bool
 }
 
 // Config represents the config file
@@ -44,6 +45,8 @@ func parseArgs() {
 			flags.SignFlag = true
 		} else if arg == "--armor" || arg == "-a" {
 			flags.ArmorFlag = true
+		} else if arg == "--detach-sign" || arg == "-d" {
+			flags.DetachSign = true
 		} else {
 			flags.OtherArgs = append(flags.OtherArgs, arg)
 		}
