@@ -1,0 +1,3 @@
+# pkcs11smimesign
+
+AAAAAAAAAAAAAAAAAAAAAH!
